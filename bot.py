@@ -31,35 +31,43 @@ def send_telegram_message(chat_id, text):
         print(f"Telegram Mesaj Gönderme Hatası: {e}")
 
 def get_wallet_portfolio(address):
-    """Helius DAS API kullanarak cüzdandaki varlıkları ve JUPITER tabanlı canlı fiyatlarını çeker."""
+    """Helius DAS API'yi tüm sayfaları (Pagination) bitene kadar döngüyle tarar."""
     url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-    
     headers = {"Content-Type": "application/json"}
-    payload = {
-        "jsonrpc": "2.0",
-        "id": "wallet-monitor",
-        "method": "getAssetsByOwner",
-        "params": {
-            "ownerAddress": address,
-            "page": 1,
-            "limit": 100,
-            "displayOptions": {
-                "showFungible": True # Tokenları (Fungible) listelemek için zorunlu
+    
+    calculated_total_usd = 0.0
+    filtered_tokens = {}
+    page = 1
+    
+    while True:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": f"wallet-monitor-p{page}",
+            "method": "getAssetsByOwner",
+            "params": {
+                "ownerAddress": address,
+                "page": page,
+                "limit": 100, # Sayfa başına maksimum 100 varlık çek
+                "displayOptions": {
+                    "showFungible": True
+                }
             }
         }
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=20)
-        if response.status_code == 200:
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
+            if response.status_code != 200:
+                print(f"Helius HTTP Hatası: {response.status_code}")
+                break
+                
             res_data = response.json()
             items = res_data.get("result", {}).get("items", [])
             
-            calculated_total_usd = 0.0
-            filtered_tokens = {}
-            
+            # Eğer sayfadan hiçbir şey dönmediyse cüzdan taraması bitmiştir
+            if not items:
+                break
+                
             for item in items:
-                # Sadece geçerli token modellerini işleme alıyoruz
                 if item.get("interface") != "FungibleToken":
                     continue
                     
@@ -68,10 +76,7 @@ def get_wallet_portfolio(address):
                 content = item.get("content", {})
                 metadata = content.get("metadata", {})
                 
-                # Sembol tespiti
                 symbol = token_info.get("symbol") or metadata.get("symbol") or "UNKNOWN"
-                
-                # Adet hesabı
                 balance = token_info.get("balance", 0)
                 decimals = token_info.get("decimals", 9)
                 clean_amount = float(balance) / (10 ** decimals)
@@ -79,19 +84,15 @@ def get_wallet_portfolio(address):
                 if clean_amount <= 0:
                     continue
                 
-                # --- CANLI VE GÜVENİLİR JUPITER TABANLI FİYAT KATMANI ---
-                # Helius DAS API, fiyata dair en doğru veriyi 'price_info' altında taşır
                 price_info = token_info.get("price_info", {})
                 usd_val = float(price_info.get("total_price", 0.0))
                 
-                # Eğer total_price eksik geldiyse ama birim fiyat varsa kendimiz çarpıyoruz
                 if usd_val == 0.0:
                     price_per_token = float(price_info.get("price_per_token", 0.0))
                     usd_val = clean_amount * price_per_token
                 
                 calculated_total_usd += usd_val
                 
-                # Sadece yatırım değeri (USD) 5000$ ve üzerinde olan genel tokenları listele
                 if usd_val >= MIN_USD_VALUE:
                     filtered_tokens[mint] = {
                         "symbol": symbol,
@@ -99,12 +100,19 @@ def get_wallet_portfolio(address):
                         "usd_value": usd_val
                     }
             
-            return calculated_total_usd, filtered_tokens
+            # Gelen token sayısı limit olan 100'den azsa, zaten son sayfadayız demektir
+            if len(items) < 100:
+                break
+                
+            # Sonraki sayfaya geç
+            page += 1
+            time.sleep(0.1) # API limitlerine takılmamak için kısa bir es
             
-    except Exception as e:
-        print(f"Helius DAS API Hatası ({address}): {e}")
-        
-    return None, None
+        except Exception as e:
+            print(f"Helius DAS API Pagination Hatası ({address}) Sayfa {page}: {e}")
+            return None, None
+            
+    return calculated_total_usd, filtered_tokens
 
 # --- WEBHOOK ENDPOINT (GELEN MESAJLARI İŞLEME) ---
 @app.route('/' + TELEGRAM_TOKEN, methods=['POST'])
@@ -136,7 +144,7 @@ def webhook_handler():
             address = args[1]
             nickname = args[2] if len(args) > 2 else address[:6]
             
-            send_telegram_message(chat_id, f"🔍 `{address}` portföyü ve canlı fiyatları sorgulanıyor...")
+            send_telegram_message(chat_id, f"🔍 `{address}` portföyünün tüm sayfaları taranıyor...")
             
             total_usd, tokens = get_wallet_portfolio(address)
             if total_usd is None:
