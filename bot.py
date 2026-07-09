@@ -23,7 +23,6 @@ def load_data_from_telegram():
     global tracked_wallets, wallet_nicknames
     print("🔄 Telegram geçmişinden cüzdan yedekleri aranıyor...")
     
-    # Telegram webhook etkinken getUpdates çalışmayacağı için önce kısa süreliğine webhook'u kaldırıyoruz
     try:
         requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
         time.sleep(1)
@@ -32,12 +31,10 @@ def load_data_from_telegram():
         res = requests.get(url, timeout=15).json()
         
         updates = res.get("result", [])
-        # En güncel yedeği bulmak için mesajları sondan başa tarıyoruz
         for update in reversed(updates):
             message = update.get("message", {})
             text = message.get("text", "")
             
-            # Eğer kendi gönderdiğimiz gizli veri paketini bulursak
             if text.startswith("📦 [TG_BACKUP_DATA]"):
                 try:
                     clean_json = text.replace("📦 [TG_BACKUP_DATA]", "").strip()
@@ -53,7 +50,6 @@ def load_data_from_telegram():
     except Exception as e:
         print(f"❌ Telegram'dan veri geri yükleme hatası: {e}")
     finally:
-        # Webhook'u tekrar aktif et
         if RENDER_EXTERNAL_URL:
             webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
             requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}")
@@ -65,14 +61,13 @@ def save_data_to_telegram():
             "tracked_wallets": tracked_wallets,
             "wallet_nicknames": wallet_nicknames
         }
-        # Botun tanıyabilmesi için özel bir başlık ekliyoruz
         backup_text = f"📦 [TG_BACKUP_DATA]\n{json.dumps(backup_payload)}"
         
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
             "chat_id": ADMIN_CHAT_ID,
             "text": backup_text,
-            "disable_notification": True  # Sana bildirim sesi gitmez, arka planda sessizce durur
+            "disable_notification": True
         }
         requests.post(url, json=payload, timeout=10)
         print("💾 Güncel yedek paketi Telegram'a gönderildi.")
@@ -207,11 +202,8 @@ def webhook_handler():
                 send_telegram_message(chat_id, "❌ Helius API bağlantı hatası.")
                 return "OK", 200
                 
-            # Hafızayı güncelle
             tracked_wallets[address] = {mint: info["amount"] for mint, info in all_tokens.items()}
             wallet_nicknames[address] = nickname
-            
-            # Telegram bulutuna yedek fırlat
             save_data_to_telegram()
             
             filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
@@ -237,7 +229,6 @@ def webhook_handler():
                 if address in wallet_nicknames:
                     del wallet_nicknames[address]
                 
-                # Yedek dosyasını güncelle
                 save_data_to_telegram()
                 send_telegram_message(chat_id, f"🗑️ *{nickname}* (`{address}`) başarıyla takipten çıkarıldı.")
             else:
@@ -245,29 +236,41 @@ def webhook_handler():
                 
         elif text.startswith('/listele'):
             if not tracked_wallets:
-                send_telegram_message(chat_id, "Takip edilen cüzdan bulunmuyor.")
+                send_telegram_message(chat_id, "📭 Takip edilen cüzdan bulunmuyor.")
             else:
-                msg = "📋 *Takip Edilen Balina Cüzdanları ve Portföyleri:*\n"
+                msg = "📊 *TAKİP EDİLEN BALİNA CÜZDANLARI VE PORTFÖYLERİ*\n"
                 
                 for addr, nickname in wallet_nicknames.items():
                     total_usd, all_tokens = get_wallet_portfolio(addr)
                     
                     if total_usd is None:
-                        msg += f"\n➖➖➖➖➖➖➖➖➖➖\n👤 *İsim:* {nickname}\n⚠️ _Veri çekilemedi (API Hatası)_\n"
+                        msg += f"\n◤ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ◥\n👤 *İsim:* {nickname}\n⚠️ _Veri çekilemedi (API Hatası)_\n◣ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ◢\n"
                         continue
                         
                     filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
                     
-                    msg += f"\n➖➖➖➖➖➖➖➖➖➖\n"
-                    msg += f"👤 *İsim:* {nickname}\n"
-                    msg += f"🔗 `{addr}`\n"
-                    msg += f"💰 *Toplam Değer:* ${total_usd:,.2f}\n\n"
+                    # Başlık Kısmı Renklendirme ve Bölme
+                    msg += f"\n◤ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ◥\n"
+                    msg += f"👤 *Balina:* {nickname}\n"
+                    msg += f"🔗 `...{addr[-8:]}`\n"  # Cüzdan adresinin sonunu göstererek karmaşayı azaltır
+                    msg += f"💰 *Toplam Bakiye:* `${total_usd:,.2f}`\n"
+                    msg += f"📋 *Büyük Pozisyonlar (>= $5,000):*\n"
                     
                     if not filtered_tokens:
-                        msg += "_5,000$ üzeri büyük yatırım bulunmuyor._\n"
+                        msg += " └ 🚫 _5,000$ üzeri büyük yatırım bulunmuyor._\n"
                     else:
                         for mint, info in filtered_tokens.items():
-                            msg += f"• *{info['symbol']}:* {info['amount']:,.2f} (${info['usd_value']:,.2f})\n"
+                            val = info['usd_value']
+                            # Değer büyüklüğüne göre akıllı emoji ataması (Renk Katmanları)
+                            if val >= 100000:
+                                icon = "💎" # 100k+$ mega pozisyon
+                            elif val >= 50000:
+                                icon = "🟢" # 50k+$ büyük pozisyon
+                            else:
+                                icon = "🔹" # 5k+$ standart büyük pozisyon
+                                
+                            msg += f" {icon} *{info['symbol']}:* {info['amount']:,.2f} (`${val:,.2f}`)\n"
+                    msg += f"◣ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ◢\n"
                 
                 send_telegram_message(chat_id, msg)
                 
@@ -294,12 +297,22 @@ def tracker_loop():
             if total_usd is None:
                 continue
                 
+            for old_mint, old_amount in list(old_tokens.items()):
+                if old_mint not in current_tokens or current_tokens[old_mint]["amount"] <= 0:
+                    alert_msg = (
+                        f"🚨 *BALİNA POZİSYONU SIFIRLADI! (TÜMÜNÜ SATTI)* 🔴\n"
+                        f"👤 *Cüzdan:* {nickname}\n"
+                        f"🪙 *Token:* Eski Varlık (Sıfırlandı)\n"
+                        f"📈 *Satılan Miktar:* {old_amount:,.2f}\n"
+                        f"📊 *Kalan Portföy Toplamı:* ${total_usd:,.2f}"
+                    )
+                    send_telegram_message(ADMIN_CHAT_ID, alert_msg)
+
             for mint, info in current_tokens.items():
-                # Yeni Token Alımı
                 if mint not in old_tokens:
                     if info["usd_value"] >= MIN_USD_VALUE:
                         alert_msg = (
-                            f"🚨 *YENİ BÜYÜK POZİSYON ANLIK ALINDI!*\n"
+                            f"🚨 *YENİ BÜYÜK POZİSYON ANLIK ALINDI!* 🟢\n"
                             f"👤 *Cüzdan:* {nickname}\n"
                             f"🪙 *Token:* {info['symbol']}\n"
                             f"💰 *Satın Alınan Değer:* ${info['usd_value']:,.2f}\n"
@@ -307,34 +320,46 @@ def tracker_loop():
                         )
                         send_telegram_message(ADMIN_CHAT_ID, alert_msg)
                 
-                # Mevcut Pozisyon Değişimi
                 else:
                     old_amount = old_tokens[mint]
                     new_amount = info["amount"]
                     diff = new_amount - old_amount
                     
-                    if abs(diff) / old_amount >= 0.10:
-                        if info["usd_value"] >= 1000 or (old_amount * (info["usd_value"]/new_amount)) >= 1000:
-                            action = "🟢 BÜYÜK ALIM YAPTI" if diff > 0 else "🔴 BÜYÜK SATIŞ YAPTI (CÜZDAN BOŞALTIYOR)"
-                            tx_msg = (
-                                f"🐳 *BALİNA HAREKETİ!* [{action}]\n"
-                                f"👤 *Cüzdan:* {nickname}\n"
-                                f"🪙 *Token:* {info['symbol']}\n"
-                                f"📈 *Miktar Değişimi:* {abs(diff):,.2f}\n"
-                                f"💰 *Kalan Token Değeri:* ${info['usd_value']:,.2f}\n"
-                                f"📊 *Cüzdan Toplam Değeri:* ${total_usd:,.2f}"
-                            )
-                            send_telegram_message(ADMIN_CHAT_ID, tx_msg)
+                    if old_amount > 0:
+                        change_ratio = diff / old_amount
+                        
+                        if change_ratio >= 0.10:
+                            if info["usd_value"] >= 1000:
+                                tx_msg = (
+                                    f"🐳 *BALİNA HAREKETİ! [🟢 BÜYÜK ALIM YAPTI]*\n"
+                                    f"👤 *Cüzdan:* {nickname}\n"
+                                    f"🪙 *Token:* {info['symbol']}\n"
+                                    f"📈 *Miktar Artışı:* +{abs(diff):,.2f}\n"
+                                    f"💰 *Mevcut Token Değeri:* ${info['usd_value']:,.2f}\n"
+                                    f"📊 *Cüzdan Toplam Değeri:* ${total_usd:,.2f}"
+                                )
+                                send_telegram_message(ADMIN_CHAT_ID, tx_msg)
+                        
+                        elif change_ratio <= -0.30:
+                            if info["usd_value"] >= 1000 or (old_amount * (info["usd_value"]/new_amount)) >= 1000:
+                                tx_msg = (
+                                    f"🐳 *BALİNA HAREKETİ! [🔴 EN AZ %30 SATIŞ YAPTI]*\n"
+                                    f"👤 *Cüzdan:* {nickname}\n"
+                                    f"🪙 *Token:* {info['symbol']}\n"
+                                    f"📉 *Miktar Azalışı:* -{abs(diff):,.2f} (Adedin %{abs(change_ratio)*100:.0f}'ı)\n"
+                                    f"💰 *Kalan Token Değeri:* ${info['usd_value']:,.2f}\n"
+                                    f"📊 *Cüzdan Toplam Değeri:* ${total_usd:,.2f}"
+                                )
+                                send_telegram_message(ADMIN_CHAT_ID, tx_msg)
 
-            # Hafızayı ve yedekleri güncelle
             tracked_wallets[address] = {mint: info["amount"] for mint, info in current_tokens.items()}
             save_data_to_telegram()
             time.sleep(2)
         time.sleep(60)
 
 # --- BOT BAŞLANGIÇ TETİKLEYİCİSİ ---
-# Render güncellendiğinde ilk bu satır çalışır ve Telegram sohbetindeki veriyi kurtarır
 load_data_from_telegram()
 
 t_tracker = threading.Thread(target=tracker_loop, daemon=True)
 t_tracker.start()
+        
