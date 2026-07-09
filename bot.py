@@ -6,7 +6,8 @@ import requests
 
 # --- AYARLAR VE ENVIRONMENT VARIABLES ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+# Solscan Pro API anahtarınız varsa buraya ekleyin, yoksa boş bırakın (Bot public endpoint deneyecek)
+SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "") 
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
@@ -17,7 +18,7 @@ wallet_nicknames = {} # { "address": "Nickname" }
 MIN_USD_VALUE = 5000.0
 
 def send_telegram_message(chat_id, text):
-    """Doğrudan Telegram HTTP API üzerinden mesaj gönderir."""
+    """Telegram üzerinden mesaj gönderir."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -30,80 +31,60 @@ def send_telegram_message(chat_id, text):
     except Exception as e:
         print(f"Telegram Mesaj Gönderme Hatası: {e}")
 
-def get_multiple_token_prices(mint_addresses):
-    """Verilen tüm token mint adreslerinin fiyatlarını tek seferde Jupiter'den çeker."""
-    if not mint_addresses:
-        return {}
+def get_wallet_portfolio(address):
+    """Doğrudan Solscan API kullanarak portföy ve token değerlerini çeker."""
+    # Solscan v2 API Account/Tokens endpoint
+    url = f"https://pro-api.solscan.io/v2/account/tokens?address={address}"
+    headers = {
+        "token": SOLSCAN_API_KEY if SOLSCAN_API_KEY else "public" # API Key yoksa public fallback dener
+    }
+    
     try:
-        ids_str = ",".join(mint_addresses)
-        url = f"https://api.jup.ag/price/v2?ids={ids_str}"
-        response = requests.get(url, timeout=8)
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        # Eğer Pro API rate limit veya auth hatası verirse, genel Solscan public web-api'sine fallback yapıyoruz
+        if response.status_code != 200:
+            url = f"https://api.solscan.io/account/tokens?address={address}"
+            response = requests.get(url, timeout=15)
+            
         if response.status_code == 200:
             res_data = response.json()
-            prices = {}
-            for mint in mint_addresses:
-                price_val = res_data.get("data", {}).get(mint, {}).get("price")
-                prices[mint] = float(price_val) if price_val else 0.0
-            return prices
-    except Exception as e:
-        print(f"Jupiter Toplu Fiyat Sorgulama Hatası: {e}")
-    return {}
-
-def get_wallet_portfolio(address):
-    """Helius'tan sadece adetleri alır, tüm fiyatlandırmayı Jupiter ile CANLI yapar."""
-    url = f"https://api.helius.xyz/v1/wallet/{address}/balances?api-key={HELIUS_API_KEY}"
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code != 200:
-            return None, None
+            # Solscan veri yapısında data listesi gelir
+            token_list = res_data.get("data", [])
             
-        data = response.json()
-        balances = data.get("balances", [])
-        
-        if not balances:
-            return 0.0, {}
-
-        # 1. Aşama: Cüzdandaki tüm tokenları tara ve mint adreslerini topla
-        mint_addresses = [item.get("mint") for item in balances if item.get("mint")]
-        
-        # 2. Aşama: Jupiter'den tüm bu tokenların gerçek ve canlı fiyatlarını tek bir istekte çek
-        jupiter_prices = get_multiple_token_prices(mint_addresses)
-        
-        calculated_total_usd = 0.0
-        filtered_tokens = {}
-        
-        # 3. Aşama: Gerçek fiyatlarla bakiye hesaplaması yap
-        for item in balances:
-            mint = item.get("mint", "SOL")
-            amount = item.get("amount", 0)
-            decimals = item.get("decimals", 9)
-            clean_amount = amount / (10 ** decimals)
-            symbol = item.get("tokenSymbol") or item.get("symbol") or "UNKNOWN"
+            calculated_total_usd = 0.0
+            filtered_tokens = {}
             
-            if clean_amount <= 0:
-                continue
+            for item in token_list:
+                # Solscan verilerinde miktar ve USD değerleri hazır gelir
+                amount = float(item.get("tokenAmount", {}).get("uiAmount", 0))
+                usd_val = float(item.get("usdAmount", 0) or item.get("value", 0))
+                symbol = item.get("tokenSymbol") or item.get("tokenName") or "UNKNOWN"
+                mint = item.get("tokenAddress") or item.get("mint", "")
                 
-            # Fiyatı kesinlikle Jupiter'den al, eğer orada yoksa Helius'un verdiğine güven (en son çare)
-            token_price = jupiter_prices.get(mint, 0.0)
-            if token_price == 0.0:
-                token_price = item.get("price") or item.get("tokenPrice") or 0.0
+                if amount <= 0:
+                    continue
+                    
+                calculated_total_usd += usd_val
                 
-            # Gerçek anlık dolar değerini hesapla
-            usd_val = clean_amount * token_price
-            calculated_total_usd += usd_val
+                # Solscan'in kendi hesapladığı USD değeri 5000$'dan büyükse filtreye al
+                if usd_val >= MIN_USD_VALUE:
+                    filtered_tokens[mint] = {
+                        "symbol": symbol,
+                        "amount": amount,
+                        "usd_value": usd_val
+                    }
             
-            # Tamamen dolar odaklı filtreleme: Adete bakmaksızın değeri 5,000$ üzerindeyse listele
-            if usd_val >= MIN_USD_VALUE:
-                filtered_tokens[mint] = {
-                    "symbol": symbol,
-                    "amount": clean_amount,
-                    "usd_value": usd_val
-                }
+            # Eğer Solscan total account value değerini ana objede taşıyorsa onu al, yoksa toplama güven
+            total_usd = res_data.get("totalUsd", calculated_total_usd)
+            if total_usd == 0:
+                total_usd = calculated_total_usd
                 
-        return calculated_total_usd, filtered_tokens
+            return total_usd, filtered_tokens
             
     except Exception as e:
-        print(f"Portföy Hesaplama Hatası ({address}): {e}")
+        print(f"Solscan API Hatası ({address}): {e}")
+        
     return None, None
 
 # --- WEBHOOK ENDPOINT (GELEN MESAJLARI İŞLEME) ---
@@ -120,7 +101,7 @@ def webhook_handler():
         
         if text.startswith('/start') or text.startswith('/help'):
             help_text = (
-                "🧠 *Solana Cüzdan İzleme Botu Aktif!*\n\n"
+                "🧠 *Solscan Tabanlı Cüzdan İzleme Botu Aktif!*\n\n"
                 "Komutlar:\n"
                 "`/ekle <cüzdan_adresi> <takma_ad>` - Listeye cüzdan ekler.\n"
                 "`/listele` - Takip edilen cüzdanları gösterir.\n"
@@ -136,19 +117,19 @@ def webhook_handler():
             address = args[1]
             nickname = args[2] if len(args) > 2 else address[:6]
             
-            send_telegram_message(chat_id, f"🔍 `{address}` inceleniyor, portföy hesaplanıyor...")
+            send_telegram_message(chat_id, f"🔍 `{address}` Solscan üzerinden sorgulanıyor...")
             
             total_usd, tokens = get_wallet_portfolio(address)
             if total_usd is None:
-                send_telegram_message(chat_id, "❌ Veri hesaplanamadı. Lütfen adresi kontrol edin.")
+                send_telegram_message(chat_id, "❌ Solscan API'den veri alınamadı.")
                 return "OK", 200
                 
             tracked_wallets[address] = {mint: info["amount"] for mint, info in tokens.items()}
             wallet_nicknames[address] = nickname
             
-            msg = f"✅ *Cüzdan Başarıyla Eklendi!*\n👤 *İsim:* {nickname}\n💰 *Toplam Portföy:* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Yatırımlar:*\n"
+            msg = f"✅ *Cüzdan Başarıyla Eklendi!*\n👤 *İsim:* {nickname}\n💰 *Toplam Portföy (Solscan):* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Yatırımlar:*\n"
             if not tokens:
-                msg += "_Bu cüzdanda 5,000$ üzerinde yatırım yapılan token bulunmuyor._"
+                msg += "_Bu cüzdanda Solscan verilerine göre 5,000$ üzerinde yatırım yapılan token bulunmuyor._"
             for mint, info in tokens.items():
                 msg += f"• *{info['symbol']}:* {info['amount']:,.2f} (${info['usd_value']:,.2f})\n"
                 
@@ -170,7 +151,7 @@ def webhook_handler():
 
 @app.route('/')
 def home():
-    return "Bot is safe and alive!", 200
+    return "Bot is live with Solscan API!", 200
 
 # --- ARKA PLAN BALİNA TAKİP DÖNGÜSÜ ---
 def tracker_loop():
@@ -193,7 +174,7 @@ def tracker_loop():
                         f"👤 *Cüzdan:* {nickname}\n"
                         f"🪙 *Token:* {info['symbol']}\n"
                         f"💰 *Yatırım Değeri:* ${info['usd_value']:,.2f}\n"
-                        f"📊 *Cüzdan Toplamı:* ${total_usd:,.2f}"
+                        f"📊 *Solscan Toplamı:* ${total_usd:,.2f}"
                     )
                     send_telegram_message(ADMIN_CHAT_ID, alert_msg)
                 else:
@@ -208,7 +189,7 @@ def tracker_loop():
                             f"👤 *Cüzdan:* {nickname}\n"
                             f"🪙 *Token:* {info['symbol']}\n"
                             f"📈 *Miktar Değişimi:* {abs(diff):,.2f}\n"
-                            f"📊 *Cüzdan Toplamı:* ${total_usd:,.2f}"
+                            f"📊 *Solscan Toplamı:* ${total_usd:,.2f}"
                         )
                         send_telegram_message(ADMIN_CHAT_ID, tx_msg)
 
