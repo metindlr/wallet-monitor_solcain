@@ -27,36 +27,73 @@ def send_telegram_message(chat_id, text):
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
-        print(f"Telegram Gönderim Durumu: {res.status_code}, Cevap: {res.text}")
+        print(f"Telegram Gönderim Durumu: {res.status_code}")
     except Exception as e:
         print(f"Telegram Mesaj Gönderme Hatası: {e}")
 
+def get_token_price_fallback(mint_address):
+    """Helius veya Jupiter üzerinden tokenın anlık birim dolar fiyatını sorgular."""
+    try:
+        # Jupiter Fiyat API'si Solana ağındaki tüm tokenların fiyatını doğrulamak için en güvenilir yoldur
+        url = f"https://api.jup.ag/price/v2?ids={mint_address}"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            res_data = response.json()
+            price = res_data.get("data", {}).get(mint_address, {}).get("price")
+            if price:
+                return float(price)
+    except Exception as e:
+        print(f"Yedek Fiyat Sorgulama Hatası ({mint_address}): {e}")
+    return 0.0
+
 def get_wallet_portfolio(address):
-    """Helius API'den cüzdan verilerini çeker."""
+    """Helius API'den cüzdanı çeker, fiyatı eksik tokenların değerini dinamik hesaplar."""
     url = f"https://api.helius.xyz/v1/wallet/{address}/balances?api-key={HELIUS_API_KEY}"
     try:
         response = requests.get(url, timeout=15)
         if response.status_code == 200:
             data = response.json()
-            total_usd = data.get("totalUsdValue", 0.0)
-            balances = data.get("balances", [])
             
+            calculated_total_usd = 0.0
+            balances = data.get("balances", [])
             filtered_tokens = {}
+            
             for item in balances:
-                usd_val = item.get("usdAmount", 0.0)
-                if usd_val >= MIN_USD_VALUE:
-                    mint = item.get("mint", "SOL")
-                    symbol = item.get("tokenSymbol", "UNKNOWN")
-                    amount = item.get("amount", 0)
-                    decimals = item.get("decimals", 9)
-                    clean_amount = amount / (10 ** decimals)
+                usd_val = item.get("usdAmount") or item.get("usd_amount") or 0.0
+                
+                amount = item.get("amount", 0)
+                decimals = item.get("decimals", 9)
+                clean_amount = amount / (10 ** decimals)
+                symbol = item.get("tokenSymbol") or item.get("symbol") or "UNKNOWN"
+                mint = item.get("mint", "SOL")
+                
+                # --- SAF DOLAR DEĞERİ DOĞRULAMA KATMANI ---
+                # Eğer Helius bu tokenın USD değerini sıfır döndüyse ama cüzdanda adet varsa:
+                if usd_val == 0 and clean_amount > 0:
+                    # Önce Helius içindeki dahili fiyatı kontrol et
+                    token_price = item.get("price") or item.get("tokenPrice") or 0.0
                     
+                    # Eğer dahili fiyat da sıfırsa, Jupiter API üzerinden gerçek birim fiyatı sorgula
+                    if token_price == 0:
+                        token_price = get_token_price_fallback(mint)
+                        
+                    # Bulunan fiyatla gerçek dolar değerini hesapla
+                    if token_price > 0:
+                        usd_val = clean_amount * token_price
+                
+                calculated_total_usd += usd_val
+                
+                # Kesinlikle sadece dolar değeri 5,000$ ve üzerinde olanları filtreye al
+                if usd_val >= MIN_USD_VALUE:
                     filtered_tokens[mint] = {
                         "symbol": symbol,
                         "amount": clean_amount,
                         "usd_value": usd_val
                     }
-            return total_usd, filtered_tokens
+            
+            final_total = max(data.get("totalUsdValue", 0.0), calculated_total_usd)
+            return final_total, filtered_tokens
+            
     except Exception as e:
         print(f"Helius API Hatası ({address}): {e}")
     return None, None
@@ -66,8 +103,6 @@ def get_wallet_portfolio(address):
 def webhook_handler():
     try:
         data = request.get_json()
-        print(f"Gelen Ham Veri: {data}")  # Render loglarında ne geldiğini görebilmek için
-        
         if not data or "message" not in data:
             return "OK", 200
             
@@ -75,7 +110,6 @@ def webhook_handler():
         chat_id = message["chat"]["id"]
         text = message.get("text", "").strip()
         
-        # 1. /start veya /help Komutu
         if text.startswith('/start') or text.startswith('/help'):
             help_text = (
                 "🧠 *Solana Cüzdan İzleme Botu Aktif!*\n\n"
@@ -85,7 +119,6 @@ def webhook_handler():
             )
             send_telegram_message(chat_id, help_text)
             
-        # 2. /ekle Komutu
         elif text.startswith('/ekle'):
             args = text.split()
             if len(args) < 2:
@@ -99,22 +132,20 @@ def webhook_handler():
             
             total_usd, tokens = get_wallet_portfolio(address)
             if total_usd is None:
-                send_telegram_message(chat_id, "❌ Helius API'den veri alınamadı. Adresi kontrol edin.")
+                send_telegram_message(chat_id, "❌ Helius API'den veri alınamadı.")
                 return "OK", 200
                 
-            # Hafızayı güncelle
             tracked_wallets[address] = {mint: info["amount"] for mint, info in tokens.items()}
             wallet_nicknames[address] = nickname
             
             msg = f"✅ *Cüzdan Başarıyla Eklendi!*\n👤 *İsim:* {nickname}\n💰 *Toplam Portföy:* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Yatırımlar:*\n"
             if not tokens:
-                msg += "_Bu cüzdanda 5,000$ üzerinde token bulunmuyor._"
+                msg += "_Bu cüzdanda 5,000$ üzerinde yatırım yapılan token bulunmuyor._"
             for mint, info in tokens.items():
                 msg += f"• *{info['symbol']}:* {info['amount']:,.2f} (${info['usd_value']:,.2f})\n"
                 
             send_telegram_message(chat_id, msg)
             
-        # 3. /listele Komutu
         elif text.startswith('/listele'):
             if not tracked_wallets:
                 send_telegram_message(chat_id, "Takip edilen cüzdan bulunmuyor.")
@@ -148,7 +179,6 @@ def tracker_loop():
                 continue
                 
             for mint, info in current_tokens.items():
-                # Yeni pozisyon açıldıysa
                 if mint not in old_tokens:
                     alert_msg = (
                         f"🚨 *YENİ TOKEN POZİSYONU!*\n"
@@ -158,7 +188,6 @@ def tracker_loop():
                         f"📊 *Cüzdan Toplamı:* ${total_usd:,.2f}"
                     )
                     send_telegram_message(ADMIN_CHAT_ID, alert_msg)
-                # Mevcut pozisyonda alım/satım olduysa
                 else:
                     old_amount = old_tokens[mint]
                     new_amount = info["amount"]
@@ -171,19 +200,16 @@ def tracker_loop():
                             f"👤 *Cüzdan:* {nickname}\n"
                             f"🪙 *Token:* {info['symbol']}\n"
                             f"📈 *Miktar Değişimi:* {abs(diff):,.2f}\n"
-                            f"💵 *Güncel Pozisyon Değeri:* ${info['usd_value']:,.2f}\n"
                             f"📊 *Cüzdan Toplamı:* ${total_usd:,.2f}"
                         )
                         send_telegram_message(ADMIN_CHAT_ID, tx_msg)
 
-            # Hafızadaki miktarları güncelle
             tracked_wallets[address] = {mint: info["amount"] for mint, info in current_tokens.items()}
             time.sleep(2)
         time.sleep(60)
 
 # --- INITIALIZATION ON START ---
 if RENDER_EXTERNAL_URL and TELEGRAM_TOKEN:
-    # Eski webhookları temizle ve yenisini kaydet
     try:
         webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
         requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
@@ -193,6 +219,5 @@ if RENDER_EXTERNAL_URL and TELEGRAM_TOKEN:
     except Exception as e:
         print(f"Webhook kurulum hatası: {e}")
 
-# Takip döngüsünü ayrı bir daemon thread olarak başlat
 t_tracker = threading.Thread(target=tracker_loop, daemon=True)
 t_tracker.start()
