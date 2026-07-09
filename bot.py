@@ -2,24 +2,37 @@ import os
 import time
 import threading
 from flask import Flask, request
-import telebot
 import requests
 
 # --- AYARLAR VE ENVIRONMENT VARIABLES ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-# Render'ın sana verdiği URL (Örn: https://botun.onrender.com)
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") 
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-tracked_wallets = {}  
-wallet_nicknames = {} 
+# Küresel hafıza (Hafızada cüzdan takibi için)
+tracked_wallets = {}  # { "address": { "mint": amount } }
+wallet_nicknames = {} # { "address": "Nickname" }
 MIN_USD_VALUE = 5000.0
 
+def send_telegram_message(chat_id, text):
+    """Doğrudan Telegram HTTP API üzerinden mesaj gönderir."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        print(f"Telegram Gönderim Durumu: {res.status_code}, Cevap: {res.text}")
+    except Exception as e:
+        print(f"Telegram Mesaj Gönderme Hatası: {e}")
+
 def get_wallet_portfolio(address):
+    """Helius API'den cüzdan verilerini çeker."""
     url = f"https://api.helius.xyz/v1/wallet/{address}/balances?api-key={HELIUS_API_KEY}"
     try:
         response = requests.get(url, timeout=15)
@@ -48,74 +61,79 @@ def get_wallet_portfolio(address):
         print(f"Helius API Hatası ({address}): {e}")
     return None, None
 
-# --- WEBHOOK ENDPOINT ---
+# --- WEBHOOK ENDPOINT (GELEN MESAJLARI İŞLEME) ---
 @app.route('/' + TELEGRAM_TOKEN, methods=['POST'])
-def get_message():
-    """Telegram'dan gelen mesajları karşılayan webhook endpoint'i"""
-    json_string = request.get_data().decode('utf-8')
-    update = telebot.types.Update.de_json(json_string)
-    bot.process_new_updates([update])
-    return "!", 200
+def webhook_handler():
+    try:
+        data = request.get_json()
+        print(f"Gelen Ham Veri: {data}")  # Render loglarında ne geldiğini görebilmek için
+        
+        if not data or "message" not in data:
+            return "OK", 200
+            
+        message = data["message"]
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+        
+        # 1. /start veya /help Komutu
+        if text.startswith('/start') or text.startswith('/help'):
+            help_text = (
+                "🧠 *Solana Cüzdan İzleme Botu Aktif!*\n\n"
+                "Komutlar:\n"
+                "`/ekle <cüzdan_adresi> <takma_ad>` - Listeye cüzdan ekler.\n"
+                "`/listele` - Takip edilen cüzdanları gösterir.\n"
+            )
+            send_telegram_message(chat_id, help_text)
+            
+        # 2. /ekle Komutu
+        elif text.startswith('/ekle'):
+            args = text.split()
+            if len(args) < 2:
+                send_telegram_message(chat_id, "⚠️ Kullanım: `/ekle <cüzdan_adresi> <takma_ad>`")
+                return "OK", 200
+                
+            address = args[1]
+            nickname = args[2] if len(args) > 2 else address[:6]
+            
+            send_telegram_message(chat_id, f"🔍 `{address}` inceleniyor, portföy hesaplanıyor...")
+            
+            total_usd, tokens = get_wallet_portfolio(address)
+            if total_usd is None:
+                send_telegram_message(chat_id, "❌ Helius API'den veri alınamadı. Adresi kontrol edin.")
+                return "OK", 200
+                
+            # Hafızayı güncelle
+            tracked_wallets[address] = {mint: info["amount"] for mint, info in tokens.items()}
+            wallet_nicknames[address] = nickname
+            
+            msg = f"✅ *Cüzdan Başarıyla Eklendi!*\n👤 *İsim:* {nickname}\n💰 *Toplam Portföy:* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Yatırımlar:*\n"
+            if not tokens:
+                msg += "_Bu cüzdanda 5,000$ üzerinde token bulunmuyor._"
+            for mint, info in tokens.items():
+                msg += f"• *{info['symbol']}:* {info['amount']:,.2f} (${info['usd_value']:,.2f})\n"
+                
+            send_telegram_message(chat_id, msg)
+            
+        # 3. /listele Komutu
+        elif text.startswith('/listele'):
+            if not tracked_wallets:
+                send_telegram_message(chat_id, "Takip edilen cüzdan bulunmuyor.")
+            else:
+                msg = "📋 *Takip Edilen Cüzdanlar:*\n\n"
+                for addr, nickname in wallet_nicknames.items():
+                    msg += f"• *{nickname}:* `{addr}`\n"
+                send_telegram_message(chat_id, msg)
+                
+    except Exception as e:
+        print(f"Webhook İşleme Hatası: {e}")
+        
+    return "OK", 200
 
 @app.route('/')
 def home():
-    """Uptime robot için ana sayfa"""
-    return "Bot is alive and watching!", 200
+    return "Bot is safe and alive!", 200
 
-# --- TELEGRAM BOT KOMUTLARI ---
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    help_text = (
-        "🧠 *Solana Cüzdan İzleme Botu Aktif!*\n\n"
-        "Komutlar:\n"
-        "`/ekle <cüzdan_adresi> <takma_ad>` - Listeye cüzdan ekler.\n"
-        "`/listele` - Takip edilen cüzdanları gösterir.\n"
-    )
-    bot.reply_to(message, help_text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['ekle'])
-def add_wallet(message):
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.reply_to(message, "⚠️ Kullanım: `/ekle <cüzdan_adresi> <takma_ad>`", parse_mode="Markdown")
-            return
-        
-        address = args[1]
-        nickname = args[2] if len(args) > 2 else address[:6]
-        
-        bot.reply_to(message, f"🔍 `{address}` inceleniyor...", parse_mode="Markdown")
-        
-        total_usd, tokens = get_wallet_portfolio(address)
-        
-        if total_usd is None:
-            bot.reply_to(message, "❌ Helius API'den veri alınamadı.")
-            return
-            
-        tracked_wallets[address] = {mint: info["amount"] for mint, info in tokens.items()}
-        wallet_nicknames[address] = nickname
-        
-        msg = f"✅ *Cüzdan Başarıyla Eklendi!*\n👤 *İsim:* {nickname}\n💰 *Toplam Portföy:* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Yatırımlar:*\n"
-        if not tokens:
-            msg += "_Bu cüzdanda 5,000$ üzerinde token bulunmuyor._"
-        for mint, info in tokens.items():
-            msg += f"• *{info['symbol']}:* {info['amount']:,.2f} (${info['usd_value']:,.2f})\n"
-            
-        bot.reply_to(message, msg, parse_mode="Markdown")
-    except Exception as e:
-        bot.reply_to(message, f"Bir hata oluştu: {e}")
-
-@bot.message_handler(commands=['listele'])
-def list_wallets(message):
-    if not tracked_wallets:
-        bot.reply_to(message, "Takip edilen cüzdan bulunmuyor.")
-        return
-    msg = "📋 *Takip Edilen Cüzdanlar:*\n\n"
-    for addr, nickname in wallet_nicknames.items():
-        msg += f"• *{nickname}:* `{addr}`\n"
-    bot.reply_to(message, msg, parse_mode="Markdown")
-
-# --- ARKA PLAN TAKİP DÖNGÜSÜ ---
+# --- ARKA PLAN BALİNA TAKİP DÖNGÜSÜ ---
 def tracker_loop():
     while True:
         if not tracked_wallets:
@@ -130,15 +148,17 @@ def tracker_loop():
                 continue
                 
             for mint, info in current_tokens.items():
+                # Yeni pozisyon açıldıysa
                 if mint not in old_tokens:
                     alert_msg = (
                         f"🚨 *YENİ TOKEN POZİSYONU!*\n"
                         f"👤 *Cüzdan:* {nickname}\n"
                         f"🪙 *Token:* {info['symbol']}\n"
                         f"💰 *Yatırım Değeri:* ${info['usd_value']:,.2f}\n"
+                        f"📊 *Cüzdan Toplamı:* ${total_usd:,.2f}"
                     )
-                    try: bot.send_message(ADMIN_CHAT_ID, alert_msg, parse_mode="Markdown")
-                    except: pass
+                    send_telegram_message(ADMIN_CHAT_ID, alert_msg)
+                # Mevcut pozisyonda alım/satım olduysa
                 else:
                     old_amount = old_tokens[mint]
                     new_amount = info["amount"]
@@ -151,27 +171,28 @@ def tracker_loop():
                             f"👤 *Cüzdan:* {nickname}\n"
                             f"🪙 *Token:* {info['symbol']}\n"
                             f"📈 *Miktar Değişimi:* {abs(diff):,.2f}\n"
-                            f"💵 *Güncel Pozisyon Değeri:* ${info['usd_value']:,.2f}"
+                            f"💵 *Güncel Pozisyon Değeri:* ${info['usd_value']:,.2f}\n"
+                            f"📊 *Cüzdan Toplamı:* ${total_usd:,.2f}"
                         )
-                        try: bot.send_message(ADMIN_CHAT_ID, tx_msg, parse_mode="Markdown")
-                        except: pass
+                        send_telegram_message(ADMIN_CHAT_ID, tx_msg)
 
+            # Hafızadaki miktarları güncelle
             tracked_wallets[address] = {mint: info["amount"] for mint, info in current_tokens.items()}
             time.sleep(2)
         time.sleep(60)
 
-# --- WEBHOOK SETTINGS ON START ---
-# Gunicorn başlatıldığında webhook'u Telegram'a kaydeder
-if RENDER_EXTERNAL_URL:
-    bot.remove_webhook()
-    time.sleep(1)
-    # Telegram'a mesajları bu URL'e post etmesini söylüyoruz
-    webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
-    bot.set_webhook(url=webhook_url)
-    print(f"Webhook başarıyla ayarlandı: {webhook_url}")
+# --- INITIALIZATION ON START ---
+if RENDER_EXTERNAL_URL and TELEGRAM_TOKEN:
+    # Eski webhookları temizle ve yenisini kaydet
+    try:
+        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+        time.sleep(1)
+        res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}")
+        print(f"Manuel Webhook Kurulumu: {res.text}")
+    except Exception as e:
+        print(f"Webhook kurulum hatası: {e}")
 
-# Arka plan takibini başlat
+# Takip döngüsünü ayrı bir daemon thread olarak başlat
 t_tracker = threading.Thread(target=tracker_loop, daemon=True)
 t_tracker.start()
-
-# Flask uygulamasını gunicorn ayağa kaldıracak, if __name__ == '__main__': kısmına gerek kalmadı.
