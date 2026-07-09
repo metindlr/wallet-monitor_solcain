@@ -11,6 +11,12 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
+# 🚨 ÖNEMLİ: Telegram'da gizli bir kanal veya grup açıp botu admin yapın.
+# O kanalın veya grubun ID'sini Render'da TG_BACKUP_CHAT_ID olarak tanımlayın.
+# Eğer uğraşmak istemiyorsan bunu direkt ADMIN_CHAT_ID ile aynı yapabilirsin, 
+# ancak botun sana gönderdiği cüzdan yedeği mesajını Telegram'da yukarıya SABİTLEMEN (Pin) gerekir!
+TG_BACKUP_CHAT_ID = os.getenv("TG_BACKUP_CHAT_ID") or ADMIN_CHAT_ID
+
 app = Flask(__name__)
 
 # Küresel hafıza yapıları
@@ -19,43 +25,37 @@ wallet_nicknames = {} # { "address": "Nickname" }
 MIN_USD_VALUE = 5000.0
 
 def load_data_from_telegram():
-    """Bot her başladığında Admin ile olan son mesajları tarayarak cüzdanları otomatik geri yükler."""
+    """Bot her başladığında Admin sohbetindeki veya yedek kanalındaki SABİTLENMİŞ mesajı okur."""
     global tracked_wallets, wallet_nicknames
-    print("🔄 Telegram geçmişinden cüzdan yedekleri aranıyor...")
+    print("🔄 Telegram Sabitlenmiş Mesajından cüzdan yedekleri yükleniyor...")
     
     try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
-        time.sleep(1)
-        
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?limit=100&allowed_updates=['message']"
+        # Chat'in genel bilgilerini alarak sabitlenmiş mesajın ID'sini buluyoruz
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getChat?chat_id={TG_BACKUP_CHAT_ID}"
         res = requests.get(url, timeout=15).json()
         
-        updates = res.get("result", [])
-        for update in reversed(updates):
-            message = update.get("message", {})
-            text = message.get("text", "")
+        pinned_message = res.get("result", {}).get("pinned_message", {})
+        text = pinned_message.get("text", "")
+        
+        if text.startswith("📦 [TG_BACKUP_DATA]"):
+            clean_json = text.replace("📦 [TG_BACKUP_DATA]", "").strip()
+            backup = json.loads(clean_json)
+            tracked_wallets = backup.get("tracked_wallets", {})
+            wallet_nicknames = backup.get("wallet_nicknames", {})
+            print("💾 BAŞARILI: Cüzdanlar Sabitlenmiş Mesajdan Ömür Boyu Korunarak Geri Yüklendi!")
+            return
+        else:
+            print("ℹ️ Sabitlenmiş mesajda geçerli yedek bulunamadı. Lütfen botun attığı yedek mesajını Telegram'da SABİTLEYİN.")
             
-            if text.startswith("📦 [TG_BACKUP_DATA]"):
-                try:
-                    clean_json = text.replace("📦 [TG_BACKUP_DATA]", "").strip()
-                    backup = json.loads(clean_json)
-                    tracked_wallets = backup.get("tracked_wallets", {})
-                    wallet_nicknames = backup.get("wallet_nicknames", {})
-                    print("💾 BAŞARILI: Cüzdanlar Telegram bulutundan otomatik olarak geri yüklendi!")
-                    return
-                except Exception as e:
-                    print(f"Yedek parse hatası: {e}")
-                    
-        print("ℹ️ Telegram geçmişinde geçerli bir yedek bulunamadı, sıfırdan başlanıyor.")
     except Exception as e:
-        print(f"❌ Telegram'dan veri geri yükleme hatası: {e}")
+        print(f"❌ Telegram Sabitli Mesaj okuma hatası: {e}")
     finally:
         if RENDER_EXTERNAL_URL:
             webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
             requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}")
 
 def save_data_to_telegram():
-    """Cüzdan listesi her değiştiğinde Admin sohbetine sessizce gizli bir yedek paketi atar."""
+    """Cüzdan listesi her değiştiğinde mevcut yedeği günceller."""
     try:
         backup_payload = {
             "tracked_wallets": tracked_wallets,
@@ -63,14 +63,20 @@ def save_data_to_telegram():
         }
         backup_text = f"📦 [TG_BACKUP_DATA]\n{json.dumps(backup_payload)}"
         
+        # Her seferinde yeni mesaj atmak yerine, Telegram'daki sabitli mesajı güncelleyebiliriz.
+        # Kolaylık olması için şimdilik admin sohbetine yeni bir kopyala-yapıştır mesajı da bırakıyoruz.
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
-            "chat_id": ADMIN_CHAT_ID,
+            "chat_id": TG_BACKUP_CHAT_ID,
             "text": backup_text,
             "disable_notification": True
         }
-        requests.post(url, json=payload, timeout=10)
-        print("💾 Güncel yedek paketi Telegram'a gönderildi.")
+        res = requests.post(url, json=payload, timeout=10).json()
+        msg_id = res.get("result", {}).get("message_id")
+        
+        if msg_id:
+            print(f"💾 Yeni yedek gönderildi. Mesaj ID: {msg_id}. Lütfen bu mesajı Telegram'da yukarıya SABİTLEYİN!")
+            
     except Exception as e:
         print(f"❌ Telegram'a yedekleme hatası: {e}")
 
@@ -249,10 +255,9 @@ def webhook_handler():
                         
                     filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
                     
-                    # Başlık Kısmı Renklendirme ve Bölme
                     msg += f"\n◤ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ◥\n"
                     msg += f"👤 *Balina:* {nickname}\n"
-                    msg += f"🔗 `...{addr[-8:]}`\n"  # Cüzdan adresinin sonunu göstererek karmaşayı azaltır
+                    msg += f"🔗 `...{addr[-8:]}`\n"
                     msg += f"💰 *Toplam Bakiye:* `${total_usd:,.2f}`\n"
                     msg += f"📋 *Büyük Pozisyonlar (>= $5,000):*\n"
                     
@@ -261,13 +266,12 @@ def webhook_handler():
                     else:
                         for mint, info in filtered_tokens.items():
                             val = info['usd_value']
-                            # Değer büyüklüğüne göre akıllı emoji ataması (Renk Katmanları)
                             if val >= 100000:
-                                icon = "💎" # 100k+$ mega pozisyon
+                                icon = "💎"
                             elif val >= 50000:
-                                icon = "🟢" # 50k+$ büyük pozisyon
+                                icon = "🟢"
                             else:
-                                icon = "🔹" # 5k+$ standart büyük pozisyon
+                                icon = "🔹"
                                 
                             msg += f" {icon} *{info['symbol']}:* {info['amount']:,.2f} (`${val:,.2f}`)\n"
                     msg += f"◣ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ◢\n"
@@ -281,7 +285,7 @@ def webhook_handler():
 
 @app.route('/')
 def home():
-    return "Bot is tracking whales perfectly with Telegram Cloud Database!", 200
+    return "Bot is tracking whales perfectly with Telegram Pinned Message Cloud DB!", 200
 
 # --- ARKA PLAN BALİNA TAKİP DÖNGÜSÜ ---
 def tracker_loop():
@@ -362,4 +366,4 @@ load_data_from_telegram()
 
 t_tracker = threading.Thread(target=tracker_loop, daemon=True)
 t_tracker.start()
-        
+                                     
