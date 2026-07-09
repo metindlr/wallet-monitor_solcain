@@ -12,7 +12,6 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 app = Flask(__name__)
 
-# Küresel hafıza (Hafızada cüzdan takibi için)
 tracked_wallets = {}  # { "address": { "mint": amount } }
 wallet_nicknames = {} # { "address": "Nickname" }
 MIN_USD_VALUE = 5000.0
@@ -31,71 +30,80 @@ def send_telegram_message(chat_id, text):
     except Exception as e:
         print(f"Telegram Mesaj Gönderme Hatası: {e}")
 
-def get_token_price_fallback(mint_address):
-    """Helius veya Jupiter üzerinden tokenın anlık birim dolar fiyatını sorgular."""
+def get_multiple_token_prices(mint_addresses):
+    """Verilen tüm token mint adreslerinin fiyatlarını tek seferde Jupiter'den çeker."""
+    if not mint_addresses:
+        return {}
     try:
-        # Jupiter Fiyat API'si Solana ağındaki tüm tokenların fiyatını doğrulamak için en güvenilir yoldur
-        url = f"https://api.jup.ag/price/v2?ids={mint_address}"
-        response = requests.get(url, timeout=5)
+        ids_str = ",".join(mint_addresses)
+        url = f"https://api.jup.ag/price/v2?ids={ids_str}"
+        response = requests.get(url, timeout=8)
         if response.status_code == 200:
             res_data = response.json()
-            price = res_data.get("data", {}).get(mint_address, {}).get("price")
-            if price:
-                return float(price)
+            prices = {}
+            for mint in mint_addresses:
+                price_val = res_data.get("data", {}).get(mint, {}).get("price")
+                prices[mint] = float(price_val) if price_val else 0.0
+            return prices
     except Exception as e:
-        print(f"Yedek Fiyat Sorgulama Hatası ({mint_address}): {e}")
-    return 0.0
+        print(f"Jupiter Toplu Fiyat Sorgulama Hatası: {e}")
+    return {}
 
 def get_wallet_portfolio(address):
-    """Helius API'den cüzdanı çeker, fiyatı eksik tokenların değerini dinamik hesaplar."""
+    """Helius'tan sadece adetleri alır, tüm fiyatlandırmayı Jupiter ile CANLI yapar."""
     url = f"https://api.helius.xyz/v1/wallet/{address}/balances?api-key={HELIUS_API_KEY}"
     try:
         response = requests.get(url, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
+        if response.status_code != 200:
+            return None, None
             
-            calculated_total_usd = 0.0
-            balances = data.get("balances", [])
-            filtered_tokens = {}
+        data = response.json()
+        balances = data.get("balances", [])
+        
+        if not balances:
+            return 0.0, {}
+
+        # 1. Aşama: Cüzdandaki tüm tokenları tara ve mint adreslerini topla
+        mint_addresses = [item.get("mint") for item in balances if item.get("mint")]
+        
+        # 2. Aşama: Jupiter'den tüm bu tokenların gerçek ve canlı fiyatlarını tek bir istekte çek
+        jupiter_prices = get_multiple_token_prices(mint_addresses)
+        
+        calculated_total_usd = 0.0
+        filtered_tokens = {}
+        
+        # 3. Aşama: Gerçek fiyatlarla bakiye hesaplaması yap
+        for item in balances:
+            mint = item.get("mint", "SOL")
+            amount = item.get("amount", 0)
+            decimals = item.get("decimals", 9)
+            clean_amount = amount / (10 ** decimals)
+            symbol = item.get("tokenSymbol") or item.get("symbol") or "UNKNOWN"
             
-            for item in balances:
-                usd_val = item.get("usdAmount") or item.get("usd_amount") or 0.0
+            if clean_amount <= 0:
+                continue
                 
-                amount = item.get("amount", 0)
-                decimals = item.get("decimals", 9)
-                clean_amount = amount / (10 ** decimals)
-                symbol = item.get("tokenSymbol") or item.get("symbol") or "UNKNOWN"
-                mint = item.get("mint", "SOL")
+            # Fiyatı kesinlikle Jupiter'den al, eğer orada yoksa Helius'un verdiğine güven (en son çare)
+            token_price = jupiter_prices.get(mint, 0.0)
+            if token_price == 0.0:
+                token_price = item.get("price") or item.get("tokenPrice") or 0.0
                 
-                # --- SAF DOLAR DEĞERİ DOĞRULAMA KATMANI ---
-                # Eğer Helius bu tokenın USD değerini sıfır döndüyse ama cüzdanda adet varsa:
-                if usd_val == 0 and clean_amount > 0:
-                    # Önce Helius içindeki dahili fiyatı kontrol et
-                    token_price = item.get("price") or item.get("tokenPrice") or 0.0
-                    
-                    # Eğer dahili fiyat da sıfırsa, Jupiter API üzerinden gerçek birim fiyatı sorgula
-                    if token_price == 0:
-                        token_price = get_token_price_fallback(mint)
-                        
-                    # Bulunan fiyatla gerçek dolar değerini hesapla
-                    if token_price > 0:
-                        usd_val = clean_amount * token_price
-                
-                calculated_total_usd += usd_val
-                
-                # Kesinlikle sadece dolar değeri 5,000$ ve üzerinde olanları filtreye al
-                if usd_val >= MIN_USD_VALUE:
-                    filtered_tokens[mint] = {
-                        "symbol": symbol,
-                        "amount": clean_amount,
-                        "usd_value": usd_val
-                    }
+            # Gerçek anlık dolar değerini hesapla
+            usd_val = clean_amount * token_price
+            calculated_total_usd += usd_val
             
-            final_total = max(data.get("totalUsdValue", 0.0), calculated_total_usd)
-            return final_total, filtered_tokens
+            # Tamamen dolar odaklı filtreleme: Adete bakmaksızın değeri 5,000$ üzerindeyse listele
+            if usd_val >= MIN_USD_VALUE:
+                filtered_tokens[mint] = {
+                    "symbol": symbol,
+                    "amount": clean_amount,
+                    "usd_value": usd_val
+                }
+                
+        return calculated_total_usd, filtered_tokens
             
     except Exception as e:
-        print(f"Helius API Hatası ({address}): {e}")
+        print(f"Portföy Hesaplama Hatası ({address}): {e}")
     return None, None
 
 # --- WEBHOOK ENDPOINT (GELEN MESAJLARI İŞLEME) ---
@@ -132,7 +140,7 @@ def webhook_handler():
             
             total_usd, tokens = get_wallet_portfolio(address)
             if total_usd is None:
-                send_telegram_message(chat_id, "❌ Helius API'den veri alınamadı.")
+                send_telegram_message(chat_id, "❌ Veri hesaplanamadı. Lütfen adresi kontrol edin.")
                 return "OK", 200
                 
             tracked_wallets[address] = {mint: info["amount"] for mint, info in tokens.items()}
