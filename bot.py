@@ -41,7 +41,7 @@ def load_data_from_telegram():
             print("💾 BAŞARILI: Cüzdanlar Sabitlenmiş Mesajdan Ömür Boyu Korunarak Geri Yüklendi!")
             return
         else:
-            print("ℹ— Sabitlenmiş mesajda geçerli yedek bulunamadı. İlk eklemede otomatik oluşturulacak.")
+            print("ℹ️ Sabitlenmiş mesajda geçerli yedek bulunamadı. İlk eklemede otomatik oluşturulacak.")
             
     except Exception as e:
         print(f"❌ Telegram Sabitli Mesaj okuma hatası: {e}")
@@ -66,7 +66,7 @@ def save_data_to_telegram():
         pinned_text = pinned_message.get("text", "")
         pinned_msg_id = pinned_message.get("message_id")
         
-        # 2. Adım: Yedek mesajı zaten sabitliyse içerik güncelle
+        # 2. Adım: Yedek mesajı zaten sabitliyse içerik güncelle (Sohbet kirlenmez)
         if pinned_msg_id and pinned_text.startswith("📦 [TG_BACKUP_DATA]"):
             edit_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
             edit_payload = {
@@ -79,7 +79,7 @@ def save_data_to_telegram():
                 print("💾 Mevcut sabitlenmiş yedek mesajı başarıyla güncellendi.")
                 return
         
-        # 3. Adım: Sabitli yedek yoksa yeni at ve PIN'le
+        # 3. Adım: Sabitli yedek yoksa yeni mesaj olarak gönder
         send_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         send_payload = {
             "chat_id": TG_BACKUP_CHAT_ID,
@@ -97,8 +97,11 @@ def save_data_to_telegram():
                 "disable_notification": True
             }
             pin_res = requests.post(pin_url, json=pin_payload, timeout=10).json()
+            
+            # Eğer otomatik pinleme başarısız olursa (Telegram DM kısıtlaması yüzünden) kullanıcıyı uyar
             if not pin_res.get("ok"):
-                print("⚠️ Botun mesaj sabitleme yetkisi eksik! Lütfen Telegram'da bota 'Mesajları Sabitle' yetkisi verin.")
+                print("⚠️ Otomatik sabitleme başarısız. Kullanıcıya manuel sabitleme uyarısı gönderiliyor.")
+                send_telegram_message(TG_BACKUP_CHAT_ID, "⚠️ *Kritik Uyarı:* Bot veritabanı yedeği gönderildi ancak otomatik sabitlenemedi. Lütfen yukarıdaki `📦 [TG_BACKUP_DATA]` mesajına sağ tıklayıp *SABİTLE (PIN)* yapın. Aksi takdirde cüzdanlarınız silinebilir!")
             else:
                 print("💾 Yeni yedek mesajı oluşturuldu ve otomatik sabitleme yapıldı.")
             
@@ -240,10 +243,10 @@ def webhook_handler():
             
             filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
             
-            # Alım panelinde de küçükten büyüğe sıralı gösterelim
-            sorted_tokens = sorted(filtered_tokens.items(), key=lambda item: item[1]['usd_value'])
+            # Alım panelinde büyükten küçüğe (reverse=True) sıralama
+            sorted_tokens = sorted(filtered_tokens.items(), key=lambda item: item[1]['usd_value'], reverse=True)
             
-            msg = f"✅ *Cüzdan Takibe Alındı!*\n👤 *İsim:* {nickname}\n💰 *Toplam Değer:* ${total_usd:,.2f}\n\n*🐋 Varlıklar (Küçükten Büyüğe):*\n"
+            msg = f"✅ *Cüzdan Takibe Alındı!*\n👤 *İsim:* {nickname}\n💰 *Toplam Değer:* ${total_usd:,.2f}\n\n*🐋 Varlıklar (Büyükten Küçüğe):*\n"
             if not sorted_tokens:
                 msg += "_Bu cüzdanda 5,000$ üzerinde yatırım bulunmuyor._"
             for mint, info in sorted_tokens:
@@ -284,14 +287,14 @@ def webhook_handler():
                         
                     filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
                     
-                    # 🎯 CRITICAL UPDATE: Tokenları dolar değerine (usd_value) göre KÜÇÜKTEN BÜYÜĞE sırala
-                    sorted_tokens = sorted(filtered_tokens.items(), key=lambda item: item[1]['usd_value'])
+                    # 🎯 CRITICAL UPDATE: Tokenları dolar değerine (usd_value) göre BÜYÜKTEN KÜÇÜĞE (reverse=True) sırala
+                    sorted_tokens = sorted(filtered_tokens.items(), key=lambda item: item[1]['usd_value'], reverse=True)
                     
                     msg += f"\n◤ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ◥\n"
                     msg += f"👤 *Balina:* {nickname}\n"
                     msg += f"🔗 `...{addr[-8:]}`\n"
                     msg += f"💰 *Toplam Bakiye:* `${total_usd:,.2f}`\n"
-                    msg += f"📋 *Büyük Pozisyonlar (Küçük -> Büyük):*\n"
+                    msg += f"📋 *Büyük Pozisyonlar (Büyük -> Küçük):*\n"
                     
                     if not sorted_tokens:
                         msg += " └ 🚫 _5,000$ üzeri büyük yatırım bulunmuyor._\n"
@@ -398,4 +401,3 @@ load_data_from_telegram()
 
 t_tracker = threading.Thread(target=tracker_loop, daemon=True)
 t_tracker.start()
-        
