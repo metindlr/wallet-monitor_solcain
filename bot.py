@@ -13,40 +13,71 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 app = Flask(__name__)
 
-# Kalıcı veri dosyası yolu (Render yeniden başlasa bile cüzdanları korur)
-DATA_FILE = "wallets.json"
-
 # Küresel hafıza yapıları
 tracked_wallets = {}  # { "address": { "mint": amount } }
 wallet_nicknames = {} # { "address": "Nickname" }
 MIN_USD_VALUE = 5000.0
 
-def load_data():
-    """Uygulama başlarken JSON dosyasından cüzdanları yükler."""
+def load_data_from_telegram():
+    """Bot her başladığında Admin ile olan son mesajları tarayarak cüzdanları otomatik geri yükler."""
     global tracked_wallets, wallet_nicknames
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                tracked_wallets = data.get("tracked_wallets", {})
-                wallet_nicknames = data.get("wallet_nicknames", {})
-                print("💾 Kalıcı cüzdan verileri başarıyla geri yüklendi.")
-        except Exception as e:
-            print(f"❌ JSON okuma hatası: {e}")
-    else:
-        print("ℹ️ Kalıcı veri dosyası bulunamadı, sıfırdan başlanıyor.")
-
-def save_data():
-    """Ekleme veya silme yapıldığında verileri JSON dosyasına yazar."""
+    print("🔄 Telegram geçmişinden cüzdan yedekleri aranıyor...")
+    
+    # Telegram webhook etkinken getUpdates çalışmayacağı için önce kısa süreliğine webhook'u kaldırıyoruz
     try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "tracked_wallets": tracked_wallets,
-                "wallet_nicknames": wallet_nicknames
-            }, f, indent=4, ensure_ascii=False)
-            print("💾 Veriler başarıyla diske kaydedildi.")
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+        time.sleep(1)
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?limit=100&allowed_updates=['message']"
+        res = requests.get(url, timeout=15).json()
+        
+        updates = res.get("result", [])
+        # En güncel yedeği bulmak için mesajları sondan başa tarıyoruz
+        for update in reversed(updates):
+            message = update.get("message", {})
+            text = message.get("text", "")
+            
+            # Eğer kendi gönderdiğimiz gizli veri paketini bulursak
+            if text.startswith("📦 [TG_BACKUP_DATA]"):
+                try:
+                    clean_json = text.replace("📦 [TG_BACKUP_DATA]", "").strip()
+                    backup = json.loads(clean_json)
+                    tracked_wallets = backup.get("tracked_wallets", {})
+                    wallet_nicknames = backup.get("wallet_nicknames", {})
+                    print("💾 BAŞARILI: Cüzdanlar Telegram bulutundan otomatik olarak geri yüklendi!")
+                    return
+                except Exception as e:
+                    print(f"Yedek parse hatası: {e}")
+                    
+        print("ℹ️ Telegram geçmişinde geçerli bir yedek bulunamadı, sıfırdan başlanıyor.")
     except Exception as e:
-        print(f"❌ JSON yazma hatası: {e}")
+        print(f"❌ Telegram'dan veri geri yükleme hatası: {e}")
+    finally:
+        # Webhook'u tekrar aktif et
+        if RENDER_EXTERNAL_URL:
+            webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
+            requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}")
+
+def save_data_to_telegram():
+    """Cüzdan listesi her değiştiğinde Admin sohbetine sessizce gizli bir yedek paketi atar."""
+    try:
+        backup_payload = {
+            "tracked_wallets": tracked_wallets,
+            "wallet_nicknames": wallet_nicknames
+        }
+        # Botun tanıyabilmesi için özel bir başlık ekliyoruz
+        backup_text = f"📦 [TG_BACKUP_DATA]\n{json.dumps(backup_payload)}"
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": ADMIN_CHAT_ID,
+            "text": backup_text,
+            "disable_notification": True  # Sana bildirim sesi gitmez, arka planda sessizce durur
+        }
+        requests.post(url, json=payload, timeout=10)
+        print("💾 Güncel yedek paketi Telegram'a gönderildi.")
+    except Exception as e:
+        print(f"❌ Telegram'a yedekleme hatası: {e}")
 
 def send_telegram_message(chat_id, text):
     """Telegram HTTP API üzerinden mesaj gönderir."""
@@ -63,7 +94,7 @@ def send_telegram_message(chat_id, text):
         print(f"Telegram Mesaj Gönderme Hatası: {e}")
 
 def get_wallet_portfolio(address):
-    """Helius DAS API'yi tüm sayfaları (Pagination) bitene kadar döngüyle tarar."""
+    """Helius DAS API'yi tüm sayfaları bitene kadar döngüyle tarar."""
     url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     headers = {"Content-Type": "application/json"}
     
@@ -121,7 +152,6 @@ def get_wallet_portfolio(address):
                 
                 calculated_total_usd += usd_val
                 
-                # Arka plan takibi için token bilgilerini kaydet
                 all_tokens[mint] = {
                     "symbol": symbol,
                     "amount": clean_amount,
@@ -177,12 +207,13 @@ def webhook_handler():
                 send_telegram_message(chat_id, "❌ Helius API bağlantı hatası.")
                 return "OK", 200
                 
-            # Hafızayı ve kalıcı veritabanını güncelle
+            # Hafızayı güncelle
             tracked_wallets[address] = {mint: info["amount"] for mint, info in all_tokens.items()}
             wallet_nicknames[address] = nickname
-            save_data()
             
-            # Sadece 5,000$ üstünü filtrele
+            # Telegram bulutuna yedek fırlat
+            save_data_to_telegram()
+            
             filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
             
             msg = f"✅ *Cüzdan Takibe Alındı!*\n👤 *İsim:* {nickname}\n💰 *Toplam Değer:* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Varlıklar:*\n"
@@ -206,7 +237,8 @@ def webhook_handler():
                 if address in wallet_nicknames:
                     del wallet_nicknames[address]
                 
-                save_data() # JSON veritabanını güncelle
+                # Yedek dosyasını güncelle
+                save_data_to_telegram()
                 send_telegram_message(chat_id, f"🗑️ *{nickname}* (`{address}`) başarıyla takipten çıkarıldı.")
             else:
                 send_telegram_message(chat_id, "❌ Bu cüzdan zaten takip listesinde bulunmuyor.")
@@ -218,14 +250,12 @@ def webhook_handler():
                 msg = "📋 *Takip Edilen Balina Cüzdanları ve Portföyleri:*\n"
                 
                 for addr, nickname in wallet_nicknames.items():
-                    # Cüzdanın anlık verilerini API'den çek
                     total_usd, all_tokens = get_wallet_portfolio(addr)
                     
                     if total_usd is None:
                         msg += f"\n➖➖➖➖➖➖➖➖➖➖\n👤 *İsim:* {nickname}\n⚠️ _Veri çekilemedi (API Hatası)_\n"
                         continue
                         
-                    # Sadece 5000$ üzeri olan tokenları filtrele
                     filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
                     
                     msg += f"\n➖➖➖➖➖➖➖➖➖➖\n"
@@ -248,7 +278,7 @@ def webhook_handler():
 
 @app.route('/')
 def home():
-    return "Bot is tracking whales with permanent database file!", 200
+    return "Bot is tracking whales perfectly with Telegram Cloud Database!", 200
 
 # --- ARKA PLAN BALİNA TAKİP DÖNGÜSÜ ---
 def tracker_loop():
@@ -265,7 +295,7 @@ def tracker_loop():
                 continue
                 
             for mint, info in current_tokens.items():
-                # --- 1. SENARYO: YENİ BİR TOKEN ALINDIĞINDA ---
+                # Yeni Token Alımı
                 if mint not in old_tokens:
                     if info["usd_value"] >= MIN_USD_VALUE:
                         alert_msg = (
@@ -277,15 +307,13 @@ def tracker_loop():
                         )
                         send_telegram_message(ADMIN_CHAT_ID, alert_msg)
                 
-                # --- 2. SENARYO: ELDEKİ TOKEN HAREKET GÖRDÜĞÜNDE ---
+                # Mevcut Pozisyon Değişimi
                 else:
                     old_amount = old_tokens[mint]
                     new_amount = info["amount"]
                     diff = new_amount - old_amount
                     
-                    # Eğer elindeki miktarın %10'undan fazlasını hareket ettirdiyse
                     if abs(diff) / old_amount >= 0.10:
-                        # Bu hareket değerli bir token üzerinde mi gerçekleşti? (En az 1000$ değerindeki varlıklar)
                         if info["usd_value"] >= 1000 or (old_amount * (info["usd_value"]/new_amount)) >= 1000:
                             action = "🟢 BÜYÜK ALIM YAPTI" if diff > 0 else "🔴 BÜYÜK SATIŞ YAPTI (CÜZDAN BOŞALTIYOR)"
                             tx_msg = (
@@ -298,25 +326,15 @@ def tracker_loop():
                             )
                             send_telegram_message(ADMIN_CHAT_ID, tx_msg)
 
-            # Cüzdan hafızasını güncelle ve JSON'a senkronize et
+            # Hafızayı ve yedekleri güncelle
             tracked_wallets[address] = {mint: info["amount"] for mint, info in current_tokens.items()}
-            save_data()
+            save_data_to_telegram()
             time.sleep(2)
         time.sleep(60)
 
-# --- BOT BAŞLANGIÇ AYARLARI ---
-# Kod ayağa kalktığı saniye eski cüzdanları JSON'dan geri yükler
-load_data()
-
-if RENDER_EXTERNAL_URL and TELEGRAM_TOKEN:
-    try:
-        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
-        time.sleep(1)
-        res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}")
-        print(f"Manuel Webhook Kurulumu: {res.text}")
-    except Exception as e:
-        print(f"Webhook kurulum hatası: {e}")
+# --- BOT BAŞLANGIÇ TETİKLEYİCİSİ ---
+# Render güncellendiğinde ilk bu satır çalışır ve Telegram sohbetindeki veriyi kurtarır
+load_data_from_telegram()
 
 t_tracker = threading.Thread(target=tracker_loop, daemon=True)
 t_tracker.start()
