@@ -12,6 +12,7 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 app = Flask(__name__)
 
+# Hafızadaki cüzdan verileri
 tracked_wallets = {}  # { "address": { "mint": amount } }
 wallet_nicknames = {} # { "address": "Nickname" }
 MIN_USD_VALUE = 5000.0
@@ -31,14 +32,14 @@ def send_telegram_message(chat_id, text):
         print(f"Telegram Mesaj Gönderme Hatası: {e}")
 
 def get_wallet_portfolio(address):
-    """Helius DAS API'yi tüm sayfaları (Pagination) bitene kadar döngüyle tarar."""
+    """Helius DAS API'yi tüm sayfaları bitene kadar döngüyle tarar."""
     url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     headers = {"Content-Type": "application/json"}
     
     calculated_total_usd = 0.0
-    filtered_tokens = {}
-    page = 1
+    all_tokens = {} # Filtresiz tüm tokenlar (Miktar takibi için arka planda her şeyi bilmeliyiz)
     
+    page = 1
     while True:
         payload = {
             "jsonrpc": "2.0",
@@ -47,23 +48,19 @@ def get_wallet_portfolio(address):
             "params": {
                 "ownerAddress": address,
                 "page": page,
-                "limit": 100, # Sayfa başına maksimum 100 varlık çek
-                "displayOptions": {
-                    "showFungible": True
-                }
+                "limit": 100,
+                "displayOptions": { "showFungible": True }
             }
         }
         
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=20)
             if response.status_code != 200:
-                print(f"Helius HTTP Hatası: {response.status_code}")
                 break
                 
             res_data = response.json()
             items = res_data.get("result", {}).get("items", [])
             
-            # Eğer sayfadan hiçbir şey dönmediyse cüzdan taraması bitmiştir
             if not items:
                 break
                 
@@ -93,26 +90,23 @@ def get_wallet_portfolio(address):
                 
                 calculated_total_usd += usd_val
                 
-                if usd_val >= MIN_USD_VALUE:
-                    filtered_tokens[mint] = {
-                        "symbol": symbol,
-                        "amount": clean_amount,
-                        "usd_value": usd_val
-                    }
+                # Arka plan takibi için token bilgilerini kaydet
+                all_tokens[mint] = {
+                    "symbol": symbol,
+                    "amount": clean_amount,
+                    "usd_value": usd_val
+                }
             
-            # Gelen token sayısı limit olan 100'den azsa, zaten son sayfadayız demektir
             if len(items) < 100:
                 break
-                
-            # Sonraki sayfaya geç
             page += 1
-            time.sleep(0.1) # API limitlerine takılmamak için kısa bir es
+            time.sleep(0.1)
             
         except Exception as e:
-            print(f"Helius DAS API Pagination Hatası ({address}) Sayfa {page}: {e}")
+            print(f"Helius DAS API Hatası ({address}): {e}")
             return None, None
             
-    return calculated_total_usd, filtered_tokens
+    return calculated_total_usd, all_tokens
 
 # --- WEBHOOK ENDPOINT (GELEN MESAJLARI İŞLEME) ---
 @app.route('/' + TELEGRAM_TOKEN, methods=['POST'])
@@ -128,10 +122,11 @@ def webhook_handler():
         
         if text.startswith('/start') or text.startswith('/help'):
             help_text = (
-                "🧠 *Solana Cüzdan İzleme Botu Aktif!*\n\n"
-                "Komutlar:\n"
-                "`/ekle <cüzdan_adresi> <takma_ad>` - Listeye cüzdan ekler.\n"
-                "`/listele` - Takip edilen cüzdanları gösterir.\n"
+                "🧠 *Solana Balina Takip Botu Aktif!*\n\n"
+                "⚙️ *Komutlar:*\n"
+                "`/ekle <cüzdan_adresi> <takma_ad>` - Cüzdanı takibe alır.\n"
+                "`/sil <cüzdan_adresi>` - Cüzdanı takipten çıkarır.\n"
+                "`/listele` - Takip edilen cüzdanları listeler.\n"
             )
             send_telegram_message(chat_id, help_text)
             
@@ -144,29 +139,49 @@ def webhook_handler():
             address = args[1]
             nickname = args[2] if len(args) > 2 else address[:6]
             
-            send_telegram_message(chat_id, f"🔍 `{address}` portföyünün tüm sayfaları taranıyor...")
+            send_telegram_message(chat_id, f"🔍 `{address}` portföyü inceleniyor...")
             
-            total_usd, tokens = get_wallet_portfolio(address)
+            total_usd, all_tokens = get_wallet_portfolio(address)
             if total_usd is None:
-                send_telegram_message(chat_id, "❌ Helius DAS RPC API üzerinden veri doğrulanamadı.")
+                send_telegram_message(chat_id, "❌ Helius API bağlantı hatası.")
                 return "OK", 200
                 
-            tracked_wallets[address] = {mint: info["amount"] for mint, info in tokens.items()}
+            # Hafızaya sadece miktar eşlemesini kaydet
+            tracked_wallets[address] = {mint: info["amount"] for mint, info in all_tokens.items()}
             wallet_nicknames[address] = nickname
             
-            msg = f"✅ *Cüzdan Başarıyla Eklendi!*\n👤 *İsim:* {nickname}\n💰 *Toplam Portföy Değeri:* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Yatırımlar:*\n"
-            if not tokens:
-                msg += "_Bu cüzdanda 5,000$ üzerinde yatırım yapılan token bulunmuyor._"
-            for mint, info in tokens.items():
+            # Telegram arayüzünde sadece 5000$ üstünü raporla
+            filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
+            
+            msg = f"✅ *Cüzdan Takibe Alındı!*\n👤 *İsim:* {nickname}\n💰 *Toplam Değer:* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Varlıklar:*\n"
+            if not filtered_tokens:
+                msg += "_Bu cüzdanda 5,000$ üzerinde yatırım bulunmuyor._"
+            for mint, info in filtered_tokens.items():
                 msg += f"• *{info['symbol']}:* {info['amount']:,.2f} (${info['usd_value']:,.2f})\n"
                 
             send_telegram_message(chat_id, msg)
             
+        elif text.startswith('/sil'):
+            args = text.split()
+            if len(args) < 2:
+                send_telegram_message(chat_id, "⚠️ Kullanım: `/sil <cüzdan_adresi>`")
+                return "OK", 200
+                
+            address = args[1]
+            if address in tracked_wallets:
+                nickname = wallet_nicknames.get(address, address[:6])
+                del tracked_wallets[address]
+                if address in wallet_nicknames:
+                    del wallet_nicknames[address]
+                send_telegram_message(chat_id, f"🗑️ *{nickname}* (`{address}`) başarıyla takipten çıkarıldı.")
+            else:
+                send_telegram_message(chat_id, "❌ Bu cüzdan zaten takip listesinde bulunmuyor.")
+                
         elif text.startswith('/listele'):
             if not tracked_wallets:
                 send_telegram_message(chat_id, "Takip edilen cüzdan bulunmuyor.")
             else:
-                msg = "📋 *Takip Edilen Cüzdanlar:*\n\n"
+                msg = "📋 *Takip Edilen Balina Cüzdanları:*\n\n"
                 for addr, nickname in wallet_nicknames.items():
                     msg += f"• *{nickname}:* `{addr}`\n"
                 send_telegram_message(chat_id, msg)
@@ -178,7 +193,7 @@ def webhook_handler():
 
 @app.route('/')
 def home():
-    return "Bot is stable and running!", 200
+    return "Bot is tracking whales perfectly!", 200
 
 # --- ARKA PLAN BALİNA TAKİP DÖNGÜSÜ ---
 def tracker_loop():
@@ -195,34 +210,44 @@ def tracker_loop():
                 continue
                 
             for mint, info in current_tokens.items():
+                # --- 1. SENARYO: YENİ BİR TOKEN ALINDIĞINDA ---
                 if mint not in old_tokens:
-                    alert_msg = (
-                        f"🚨 *YENİ TOKEN POZİSYONU!*\n"
-                        f"👤 *Cüzdan:* {nickname}\n"
-                        f"🪙 *Token:* {info['symbol']}\n"
-                        f"💰 *Yatırım Değeri:* ${info['usd_value']:,.2f}\n"
-                        f"📊 *Toplam Portföy:* ${total_usd:,.2f}"
-                    )
-                    send_telegram_message(ADMIN_CHAT_ID, alert_msg)
+                    # Yeni alınan tokenın toplam değeri 5000$'dan büyükse alarma değer
+                    if info["usd_value"] >= MIN_USD_VALUE:
+                        alert_msg = (
+                            f"🚨 *YENİ BÜYÜK POZİSYON ANLIK ALINDI!*\n"
+                            f"👤 *Cüzdan:* {nickname}\n"
+                            f"🪙 *Token:* {info['symbol']}\n"
+                            f"💰 *Satın Alınan Değer:* ${info['usd_value']:,.2f}\n"
+                            f"📊 *Cüzdan Toplamı:* ${total_usd:,.2f}"
+                        )
+                        send_telegram_message(ADMIN_CHAT_ID, alert_msg)
+                
+                # --- 2. SENARYO: ELDEKİ TOKEN SATILDIĞINDA VEYA EKLEME YAPILDIĞINDA ---
                 else:
                     old_amount = old_tokens[mint]
                     new_amount = info["amount"]
                     diff = new_amount - old_amount
                     
-                    if abs(diff) / old_amount > 0.01:
-                        action = "🟢 ALIM YAPTI" if diff > 0 else "🔴 SATIM YAPTI"
-                        tx_msg = (
-                            f"🐳 *BALİNA HAREKETİ!* [{action}]\n"
-                            f"👤 *Cüzdan:* {nickname}\n"
-                            f"🪙 *Token:* {info['symbol']}\n"
-                            f"📈 *Miktar Değişimi:* {abs(diff):,.2f}\n"
-                            f"📊 *Toplam Portföy:* ${total_usd:,.2f}"
-                        )
-                        send_telegram_message(ADMIN_CHAT_ID, tx_msg)
+                    # Eğer elindeki miktarın %10'undan fazlasını hareket ettirdiyse
+                    if abs(diff) / old_amount >= 0.10:
+                        # Bu hareket değerli bir token üzerinde mi gerçekleşti? (En az 1000$ değerindeki varlıklar)
+                        if info["usd_value"] >= 1000 or (old_amount * (info["usd_value"]/new_amount)) >= 1000:
+                            action = "🟢 BÜYÜK ALIM YAPTI" if diff > 0 else "🔴 BÜYÜK SATIŞ YAPTI (CÜZDAN BOŞALTIYOR)"
+                            tx_msg = (
+                                f"🐳 *BALİNA HAREKETİ!* [{action}]\n"
+                                f"👤 *Cüzdan:* {nickname}\n"
+                                f"🪙 *Token:* {info['symbol']}\n"
+                                f"📈 *Miktar Değişimi:* {abs(diff):,.2f}\n"
+                                f"💰 *Kalan Token Değeri:* ${info['usd_value']:,.2f}\n"
+                                f"📊 *Cüzdan Toplam Değeri:* ${total_usd:,.2f}"
+                            )
+                            send_telegram_message(ADMIN_CHAT_ID, tx_msg)
 
+            # Cüzdanın son durumunu kaydet (Satılan token tamamen sıfırlandıysa listeden düşer)
             tracked_wallets[address] = {mint: info["amount"] for mint, info in current_tokens.items()}
-            time.sleep(2)
-        time.sleep(60)
+            time.sleep(2) # Helius rate limit koruması
+        time.sleep(60) # Her 60 saniyede bir cüzdanları baştan tara
 
 # --- INITIALIZATION ON START ---
 if RENDER_EXTERNAL_URL and TELEGRAM_TOKEN:
