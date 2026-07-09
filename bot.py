@@ -11,10 +11,7 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# 🚨 ÖNEMLİ: Telegram'da gizli bir kanal veya grup açıp botu admin yapın.
-# O kanalın veya grubun ID'sini Render'da TG_BACKUP_CHAT_ID olarak tanımlayın.
-# Eğer uğraşmak istemiyorsan bunu direkt ADMIN_CHAT_ID ile aynı yapabilirsin, 
-# ancak botun sana gönderdiği cüzdan yedeği mesajını Telegram'da yukarıya SABİTLEMEN (Pin) gerekir!
+# Yedeklerin saklanacağı Chat ID (Varsayılan olarak ADMIN_CHAT_ID)
 TG_BACKUP_CHAT_ID = os.getenv("TG_BACKUP_CHAT_ID") or ADMIN_CHAT_ID
 
 app = Flask(__name__)
@@ -25,7 +22,7 @@ wallet_nicknames = {} # { "address": "Nickname" }
 MIN_USD_VALUE = 5000.0
 
 def load_data_from_telegram():
-    """Bot her başladığında Admin sohbetindeki veya yedek kanalındaki SABİTLENMİŞ mesajı okur."""
+    """Bot her başladığında Admin sohbetindeki veya yedek kanalındaki SABİTLENMISHED mesajı okur."""
     global tracked_wallets, wallet_nicknames
     print("🔄 Telegram Sabitlenmiş Mesajından cüzdan yedekleri yükleniyor...")
     
@@ -45,7 +42,7 @@ def load_data_from_telegram():
             print("💾 BAŞARILI: Cüzdanlar Sabitlenmiş Mesajdan Ömür Boyu Korunarak Geri Yüklendi!")
             return
         else:
-            print("ℹ️ Sabitlenmiş mesajda geçerli yedek bulunamadı. Lütfen botun attığı yedek mesajını Telegram'da SABİTLEYİN.")
+            print("ℹ️ Sabitlenmiş mesajda geçerli yedek bulunamadı, sıfırdan başlanacak veya ilk eklemede oluşturulacak.")
             
     except Exception as e:
         print(f"❌ Telegram Sabitli Mesaj okuma hatası: {e}")
@@ -55,7 +52,7 @@ def load_data_from_telegram():
             requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}")
 
 def save_data_to_telegram():
-    """Cüzdan listesi her değiştiğinde mevcut yedeği günceller."""
+    """Cüzdan listesi her değiştiğinde mevcut sabit mesajı bulur ve OTOMATİK düzenler (edit) veya yeni oluşturup sabitler."""
     try:
         backup_payload = {
             "tracked_wallets": tracked_wallets,
@@ -63,22 +60,49 @@ def save_data_to_telegram():
         }
         backup_text = f"📦 [TG_BACKUP_DATA]\n{json.dumps(backup_payload)}"
         
-        # Her seferinde yeni mesaj atmak yerine, Telegram'daki sabitli mesajı güncelleyebiliriz.
-        # Kolaylık olması için şimdilik admin sohbetine yeni bir kopyala-yapıştır mesajı da bırakıyoruz.
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
+        # 1. Adım: Önce sohbette şu an sabitlenmiş bir mesaj var mı kontrol et
+        get_chat_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getChat?chat_id={TG_BACKUP_CHAT_ID}"
+        chat_res = requests.get(get_chat_url, timeout=10).json()
+        pinned_message = chat_res.get("result", {}).get("pinned_message", {})
+        pinned_text = pinned_message.get("text", "")
+        pinned_msg_id = pinned_message.get("message_id")
+        
+        # 2. Adım: Eğer halihazırda yedek formatında sabitli bir mesaj VARSA, onu düzenle (Sohbet temiz kalır)
+        if pinned_msg_id and pinned_text.startswith("📦 [TG_BACKUP_DATA]"):
+            edit_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+            edit_payload = {
+                "chat_id": TG_BACKUP_CHAT_ID,
+                "message_id": pinned_msg_id,
+                "text": backup_text
+            }
+            edit_res = requests.post(edit_url, json=edit_payload, timeout=10).json()
+            if edit_res.get("ok"):
+                print("💾 Mevcut sabitlenmiş yedek mesajı başarıyla güncellendi.")
+                return
+        
+        # 3. Adım: Eğer sabitli mesaj YOKSA veya format dışıysa, YENİ mesaj gönder ve otomatik sabitle
+        send_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        send_payload = {
             "chat_id": TG_BACKUP_CHAT_ID,
             "text": backup_text,
             "disable_notification": True
         }
-        res = requests.post(url, json=payload, timeout=10).json()
-        msg_id = res.get("result", {}).get("message_id")
+        send_res = requests.post(send_url, json=send_payload, timeout=10).json()
+        new_msg_id = send_res.get("result", {}).get("message_id")
         
-        if msg_id:
-            print(f"💾 Yeni yedek gönderildi. Mesaj ID: {msg_id}. Lütfen bu mesajı Telegram'da yukarıya SABİTLEYİN!")
+        if new_msg_id:
+            # Yeni mesajı otomatik sabitleme (pin) komutu
+            pin_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage"
+            pin_payload = {
+                "chat_id": TG_BACKUP_CHAT_ID,
+                "message_id": new_msg_id,
+                "disable_notification": True
+            }
+            requests.post(pin_url, json=pin_payload, timeout=10)
+            print("💾 Yeni yedek mesajı oluşturuldu ve otomatik olarak en tepeye sabitlendi!")
             
     except Exception as e:
-        print(f"❌ Telegram'a yedekleme hatası: {e}")
+        print(f"❌ Telegram Otomatik Yedekleme/Sabitleme Hatası: {e}")
 
 def send_telegram_message(chat_id, text):
     """Telegram HTTP API üzerinden mesaj gönderir."""
@@ -210,6 +234,8 @@ def webhook_handler():
                 
             tracked_wallets[address] = {mint: info["amount"] for mint, info in all_tokens.items()}
             wallet_nicknames[address] = nickname
+            
+            # Değişiklik oldu, otomatik yedekle ve yukarı sabitle
             save_data_to_telegram()
             
             filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
@@ -235,6 +261,7 @@ def webhook_handler():
                 if address in wallet_nicknames:
                     del wallet_nicknames[address]
                 
+                # Değişiklik oldu, otomatik yedekle ve yukarı sabitle
                 save_data_to_telegram()
                 send_telegram_message(chat_id, f"🗑️ *{nickname}* (`{address}`) başarıyla takipten çıkarıldı.")
             else:
@@ -356,6 +383,7 @@ def tracker_loop():
                                 )
                                 send_telegram_message(ADMIN_CHAT_ID, tx_msg)
 
+            # Hafızayı güncelle ve sessizce buluttaki sabit mesajı yenile
             tracked_wallets[address] = {mint: info["amount"] for mint, info in current_tokens.items()}
             save_data_to_telegram()
             time.sleep(2)
@@ -366,4 +394,4 @@ load_data_from_telegram()
 
 t_tracker = threading.Thread(target=tracker_loop, daemon=True)
 t_tracker.start()
-                                     
+            
