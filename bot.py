@@ -13,7 +13,7 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 app = Flask(__name__)
 
-# Kalıcı veri dosyası yolu
+# Kalıcı veri dosyası yolu (Render yeniden başlasa bile cüzdanları korur)
 DATA_FILE = "wallets.json"
 
 # Küresel hafıza yapıları
@@ -63,7 +63,7 @@ def send_telegram_message(chat_id, text):
         print(f"Telegram Mesaj Gönderme Hatası: {e}")
 
 def get_wallet_portfolio(address):
-    """Helius DAS API'yi tüm sayfaları bitene kadar döngüyle tarar."""
+    """Helius DAS API'yi tüm sayfaları (Pagination) bitene kadar döngüyle tarar."""
     url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     headers = {"Content-Type": "application/json"}
     
@@ -121,6 +121,7 @@ def get_wallet_portfolio(address):
                 
                 calculated_total_usd += usd_val
                 
+                # Arka plan takibi için token bilgilerini kaydet
                 all_tokens[mint] = {
                     "symbol": symbol,
                     "amount": clean_amount,
@@ -133,12 +134,12 @@ def get_wallet_portfolio(address):
             time.sleep(0.1)
             
         except Exception as e:
-            print(f"Helius DAS API Hatası ({address}): {e}")
+            print(f"Helius DAS API Hatası ({address}) Sayfa {page}: {e}")
             return None, None
             
     return calculated_total_usd, all_tokens
 
-# --- WEBHOOK ENDPOINT ---
+# --- WEBHOOK ENDPOINT (GELEN MESAJLARI İŞLEME) ---
 @app.route('/' + TELEGRAM_TOKEN, methods=['POST'])
 def webhook_handler():
     try:
@@ -156,7 +157,7 @@ def webhook_handler():
                 "⚙️ *Komutlar:*\n"
                 "`/ekle <cüzdan_adresi> <takma_ad>` - Cüzdanı takibe alır.\n"
                 "`/sil <cüzdan_adresi>` - Cüzdanı takipten çıkarır.\n"
-                "`/listele` - Takip edilen cüzdanları listeler.\n"
+                "`/listele` - Takip edilen cüzdanları ve tüm token detaylarını gösterir.\n"
             )
             send_telegram_message(chat_id, help_text)
             
@@ -169,18 +170,19 @@ def webhook_handler():
             address = args[1]
             nickname = args[2] if len(args) > 2 else address[:6]
             
-            send_telegram_message(chat_id, f"🔍 `{address}` portföyü inceleniyor...")
+            send_telegram_message(chat_id, f"🔍 `{address}` portföyünün tüm sayfaları inceleniyor...")
             
             total_usd, all_tokens = get_wallet_portfolio(address)
             if total_usd is None:
                 send_telegram_message(chat_id, "❌ Helius API bağlantı hatası.")
                 return "OK", 200
                 
-            # Hafızayı ve kalıcı diski güncelle
+            # Hafızayı ve kalıcı veritabanını güncelle
             tracked_wallets[address] = {mint: info["amount"] for mint, info in all_tokens.items()}
             wallet_nicknames[address] = nickname
-            save_data() # JSON dosyasına yaz
+            save_data()
             
+            # Sadece 5,000$ üstünü filtrele
             filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
             
             msg = f"✅ *Cüzdan Takibe Alındı!*\n👤 *İsim:* {nickname}\n💰 *Toplam Değer:* ${total_usd:,.2f}\n\n*🐋 5,000$ Üzeri Varlıklar:*\n"
@@ -204,7 +206,7 @@ def webhook_handler():
                 if address in wallet_nicknames:
                     del wallet_nicknames[address]
                 
-                save_data() # JSON dosyasını güncelle
+                save_data() # JSON veritabanını güncelle
                 send_telegram_message(chat_id, f"🗑️ *{nickname}* (`{address}`) başarıyla takipten çıkarıldı.")
             else:
                 send_telegram_message(chat_id, "❌ Bu cüzdan zaten takip listesinde bulunmuyor.")
@@ -213,9 +215,30 @@ def webhook_handler():
             if not tracked_wallets:
                 send_telegram_message(chat_id, "Takip edilen cüzdan bulunmuyor.")
             else:
-                msg = "📋 *Takip Edilen Balina Cüzdanları:*\n\n"
+                msg = "📋 *Takip Edilen Balina Cüzdanları ve Portföyleri:*\n"
+                
                 for addr, nickname in wallet_nicknames.items():
-                    msg += f"• *{nickname}:* `{addr}`\n"
+                    # Cüzdanın anlık verilerini API'den çek
+                    total_usd, all_tokens = get_wallet_portfolio(addr)
+                    
+                    if total_usd is None:
+                        msg += f"\n➖➖➖➖➖➖➖➖➖➖\n👤 *İsim:* {nickname}\n⚠️ _Veri çekilemedi (API Hatası)_\n"
+                        continue
+                        
+                    # Sadece 5000$ üzeri olan tokenları filtrele
+                    filtered_tokens = {m: i for m, i in all_tokens.items() if i["usd_value"] >= MIN_USD_VALUE}
+                    
+                    msg += f"\n➖➖➖➖➖➖➖➖➖➖\n"
+                    msg += f"👤 *İsim:* {nickname}\n"
+                    msg += f"🔗 `{addr}`\n"
+                    msg += f"💰 *Toplam Değer:* ${total_usd:,.2f}\n\n"
+                    
+                    if not filtered_tokens:
+                        msg += "_5,000$ üzeri büyük yatırım bulunmuyor._\n"
+                    else:
+                        for mint, info in filtered_tokens.items():
+                            msg += f"• *{info['symbol']}:* {info['amount']:,.2f} (${info['usd_value']:,.2f})\n"
+                
                 send_telegram_message(chat_id, msg)
                 
     except Exception as e:
@@ -242,6 +265,7 @@ def tracker_loop():
                 continue
                 
             for mint, info in current_tokens.items():
+                # --- 1. SENARYO: YENİ BİR TOKEN ALINDIĞINDA ---
                 if mint not in old_tokens:
                     if info["usd_value"] >= MIN_USD_VALUE:
                         alert_msg = (
@@ -252,12 +276,16 @@ def tracker_loop():
                             f"📊 *Cüzdan Toplamı:* ${total_usd:,.2f}"
                         )
                         send_telegram_message(ADMIN_CHAT_ID, alert_msg)
+                
+                # --- 2. SENARYO: ELDEKİ TOKEN HAREKET GÖRDÜĞÜNDE ---
                 else:
                     old_amount = old_tokens[mint]
                     new_amount = info["amount"]
                     diff = new_amount - old_amount
                     
+                    # Eğer elindeki miktarın %10'undan fazlasını hareket ettirdiyse
                     if abs(diff) / old_amount >= 0.10:
+                        # Bu hareket değerli bir token üzerinde mi gerçekleşti? (En az 1000$ değerindeki varlıklar)
                         if info["usd_value"] >= 1000 or (old_amount * (info["usd_value"]/new_amount)) >= 1000:
                             action = "🟢 BÜYÜK ALIM YAPTI" if diff > 0 else "🔴 BÜYÜK SATIŞ YAPTI (CÜZDAN BOŞALTIYOR)"
                             tx_msg = (
@@ -270,7 +298,7 @@ def tracker_loop():
                             )
                             send_telegram_message(ADMIN_CHAT_ID, tx_msg)
 
-            # Cüzdan hafızasını güncelle ve JSON'a eşitle
+            # Cüzdan hafızasını güncelle ve JSON'a senkronize et
             tracked_wallets[address] = {mint: info["amount"] for mint, info in current_tokens.items()}
             save_data()
             time.sleep(2)
